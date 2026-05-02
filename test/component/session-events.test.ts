@@ -96,10 +96,13 @@ test('PiAcpSession: emits tool_call + tool_call_update + completes', async () =>
   assert.equal((conn.updates[0]!.update as any).toolCallId, 't1')
   assert.equal((conn.updates[0]!.update as any).status, 'in_progress')
   assert.equal((conn.updates[0]!.update as any).locations, undefined)
-  // bash maps to execute ToolKind, so _meta.terminal_info is included.
+  // bash maps to execute ToolKind, so _meta.terminal_info and terminal content are included.
   assert.deepEqual((conn.updates[0]!.update as any)._meta, {
     terminal_info: { terminal_id: 'pi-term-t1', cwd: process.cwd() }
   })
+  assert.deepEqual((conn.updates[0]!.update as any).content, [
+    { type: 'terminal', terminalId: 'pi-term-t1' }
+  ])
 
   assert.equal(conn.updates[1]!.update.sessionUpdate, 'tool_call_update')
   assert.equal((conn.updates[1]!.update as any).toolCallId, 't1')
@@ -410,6 +413,9 @@ test('PiAcpSession: streams bash tool_call with terminal_info on toolcall_start'
   assert.deepEqual((conn.updates[0]!.update as any)._meta, {
     terminal_info: { terminal_id: 'pi-term-t1', cwd: process.cwd() }
   })
+  assert.deepEqual((conn.updates[0]!.update as any).content, [
+    { type: 'terminal', terminalId: 'pi-term-t1' }
+  ])
 })
 
 test('PiAcpSession: emits edit tool line when oldText matches uniquely', async () => {

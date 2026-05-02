@@ -3,6 +3,7 @@ import type {
   ContentBlock,
   McpServer,
   SessionUpdate,
+  Terminal,
   ToolCallContent,
   ToolCallLocation,
   ToolKind
@@ -455,6 +456,13 @@ export class PiAcpSession {
                 status,
                 locations,
                 rawInput,
+                // Include a terminal content block so Zed associates the
+                // terminal entity with this tool call. The _meta.terminal_info
+                // pre-handler creates the terminal entity first; then
+                // ToolCallContent::from_acp resolves it from the terminals HashMap.
+                content: termId
+                  ? ([{ type: 'terminal', terminalId: termId }] satisfies (ToolCallContent | { type: 'terminal'; terminalId: string })[])
+                  : undefined,
                 ...(termId ? { _meta: { terminal_info: { terminal_id: termId, cwd: this.cwd } } } : {})
               })
             } else {
@@ -523,6 +531,9 @@ export class PiAcpSession {
             status: 'in_progress',
             locations,
             rawInput: args,
+            content: terminalId
+              ? ([{ type: 'terminal', terminalId: terminalId }] satisfies (ToolCallContent | { type: 'terminal'; terminalId: string })[])
+              : undefined,
             // Zed reads _meta.terminal_info to create a display-only terminal entity
             // associated with this tool call.
             ...(terminalId ? { _meta: { terminal_info: { terminal_id: terminalId, cwd: this.cwd } } } : {})

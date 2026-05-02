@@ -25,6 +25,39 @@ export function getPiAgentDir(): string {
   return join(homedir(), '.pi', 'agent')
 }
 
+function isMeaningfulEnvValue(value: string | undefined): value is string {
+  if (typeof value !== 'string') return false
+  const trimmed = value.trim()
+  if (!trimmed) return false
+  if (trimmed.startsWith('<') && trimmed.endsWith('>')) return false
+  return true
+}
+
+function hasBedrockAuthConfigured(): boolean {
+  return Boolean(
+    isMeaningfulEnvValue(process.env.AWS_PROFILE) ||
+      (isMeaningfulEnvValue(process.env.AWS_ACCESS_KEY_ID) && isMeaningfulEnvValue(process.env.AWS_SECRET_ACCESS_KEY)) ||
+      isMeaningfulEnvValue(process.env.AWS_BEARER_TOKEN_BEDROCK) ||
+      isMeaningfulEnvValue(process.env.AWS_CONTAINER_CREDENTIALS_RELATIVE_URI) ||
+      isMeaningfulEnvValue(process.env.AWS_CONTAINER_CREDENTIALS_FULL_URI) ||
+      isMeaningfulEnvValue(process.env.AWS_WEB_IDENTITY_TOKEN_FILE)
+  )
+}
+
+function hasVertexAuthConfigured(): boolean {
+  const cloudApiKey = process.env.GOOGLE_CLOUD_API_KEY
+  if (isMeaningfulEnvValue(cloudApiKey) && cloudApiKey.trim() !== 'gcp-vertex-credentials') return true
+
+  const credentialsPath = process.env.GOOGLE_APPLICATION_CREDENTIALS
+  const hasExplicitCredentials = typeof credentialsPath === 'string' && credentialsPath.trim() && existsSync(credentialsPath)
+  const hasDefaultCredentials = existsSync(join(homedir(), '.config', 'gcloud', 'application_default_credentials.json'))
+
+  const project = process.env.GOOGLE_CLOUD_PROJECT || process.env.GCLOUD_PROJECT
+  const location = process.env.GOOGLE_CLOUD_LOCATION
+
+  return Boolean((hasExplicitCredentials || hasDefaultCredentials) && isMeaningfulEnvValue(project) && isMeaningfulEnvValue(location))
+}
+
 export function hasAnyPiAuthConfigured(): boolean {
   // 1) auth.json present and non-empty (api keys or oauth creds)
   const agentDir = getPiAgentDir()
@@ -50,6 +83,7 @@ export function hasAnyPiAuthConfigured(): boolean {
   const envVars = [
     'OPENAI_API_KEY',
     'AZURE_OPENAI_API_KEY',
+    'DEEPSEEK_API_KEY',
     'GEMINI_API_KEY',
     'GROQ_API_KEY',
     'CEREBRAS_API_KEY',
@@ -60,9 +94,13 @@ export function hasAnyPiAuthConfigured(): boolean {
     'MISTRAL_API_KEY',
     'MINIMAX_API_KEY',
     'MINIMAX_CN_API_KEY',
+    'MOONSHOT_API_KEY',
     'HF_TOKEN',
+    'FIREWORKS_API_KEY',
     'OPENCODE_API_KEY',
     'KIMI_API_KEY',
+    'CLOUDFLARE_API_KEY',
+    'XIAOMI_API_KEY',
     // Copilot/github
     'COPILOT_GITHUB_TOKEN',
     'GH_TOKEN',
@@ -76,6 +114,10 @@ export function hasAnyPiAuthConfigured(): boolean {
     const v = process.env[k]
     if (typeof v === 'string' && v.trim()) return true
   }
+
+  // 4) Provider-specific non-simple auth mirrors pi's stricter requirements.
+  if (hasVertexAuthConfigured()) return true
+  if (hasBedrockAuthConfigured()) return true
 
   return false
 }

@@ -57,6 +57,24 @@ export function getEnableSkillCommands(cwd: string): boolean {
   return true
 }
 
+export function getEnableExtensionCommands(cwd: string): boolean {
+  const env = process.env.PI_ACP_ENABLE_EXTENSION_COMMANDS
+  if (typeof env === 'string') {
+    const normalized = env.trim().toLowerCase()
+    if (['1', 'true', 'yes', 'on'].includes(normalized)) return true
+    if (['0', 'false', 'no', 'off'].includes(normalized)) return false
+  }
+
+  const merged = getMergedSettings(cwd)
+
+  const direct = merged.enableExtensionCommands
+  if (typeof direct === 'boolean') return direct
+
+  // Keep extension-sourced slash commands opt-in: pi-acp does not emulate pi's
+  // full TUI/extension runtime, so advertised extension commands may not work.
+  return false
+}
+
 /**
  * Mirror pi's quietStartup setting: if true, pi suppresses the verbose startup prelude.
  * We use it to decide whether to synthesize + emit our own "startup info" message.

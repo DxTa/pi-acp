@@ -28,7 +28,7 @@ import { normalizePiAssistantText, normalizePiMessageText } from './translate/pi
 import { toolResultToText } from './translate/pi-tools.js'
 import { promptToPiMessage } from './translate/prompt.js'
 import { loadSlashCommands, parseCommandArgs, toAvailableCommands } from './slash-commands.js'
-import { getAgentDir, getEnableSkillCommands, getQuietStartup } from './pi-settings.js'
+import { getAgentDir, getEnableExtensionCommands, getEnableSkillCommands, getQuietStartup } from './pi-settings.js'
 import { toAvailableCommandsFromPiGetCommands } from './pi-commands.js'
 import { isAbsolute } from 'node:path'
 import { existsSync, readFileSync, realpathSync, readdirSync, statSync } from 'node:fs'
@@ -102,6 +102,7 @@ export class PiAcpAgent implements ACPAgent {
   private readonly conn: AgentSideConnection
   private readonly sessions = new SessionManager()
   private readonly store = new SessionStore()
+  private readonly restoringSessions = new Map<string, Promise<ReturnType<SessionManager['get']>>>()
 
   dispose(): void {
     this.sessions.disposeAll()
@@ -113,6 +114,57 @@ export class PiAcpAgent implements ACPAgent {
   constructor(conn: AgentSideConnection, _config?: unknown) {
     this.conn = conn
     void _config
+  }
+
+  private async requireSession(sessionId: string): Promise<ReturnType<SessionManager['get']>> {
+    const existing = (this.sessions as any).maybeGet?.(sessionId)
+    if (existing) return existing
+
+    // Compatibility with older tests/stubs that only implement get(). Real SessionManager
+    // implements maybeGet(), so production missing-session paths fall through to restore.
+    if (typeof (this.sessions as any).maybeGet !== 'function') {
+      return this.sessions.get(sessionId)
+    }
+
+    const pendingRestore = this.restoringSessions.get(sessionId)
+    if (pendingRestore) return pendingRestore
+
+    const restore = (async () => {
+      const stored = this.store.get(sessionId)
+      if (!stored) throw RequestError.invalidParams(`Unknown sessionId: ${sessionId}`)
+
+      let proc: PiRpcProcess
+      try {
+        proc = await PiRpcProcess.spawn({
+          cwd: stored.cwd,
+          sessionPath: stored.sessionFile,
+          piCommand: process.env.PI_ACP_PI_COMMAND
+        })
+      } catch (e: any) {
+        if (e?.name === 'PiRpcSpawnError') {
+          throw RequestError.internalError({ code: e?.code }, String(e?.message ?? e))
+        }
+        throw e
+      }
+
+      const session = this.sessions.getOrCreate(sessionId, {
+        cwd: stored.cwd,
+        mcpServers: [],
+        conn: this.conn,
+        proc,
+        fileCommands: loadSlashCommands(stored.cwd)
+      })
+
+      this.lastSessionCwd = stored.cwd
+      return session
+    })()
+
+    this.restoringSessions.set(sessionId, restore)
+    try {
+      return await restore
+    } finally {
+      this.restoringSessions.delete(sessionId)
+    }
   }
 
   async initialize(params: InitializeRequest): Promise<InitializeResponse> {
@@ -168,6 +220,7 @@ export class PiAcpAgent implements ACPAgent {
 
     const fileCommands = loadSlashCommands(params.cwd)
     const enableSkillCommands = getEnableSkillCommands(params.cwd)
+    const enableExtensionCommands = getEnableExtensionCommands(params.cwd)
 
     // Pi doesn't support mcpServers, but we accept and store.
     const session = await this.sessions.create({
@@ -237,13 +290,6 @@ export class PiAcpAgent implements ACPAgent {
     if (preludeText)
       session.setStartupInfo(preludeText)
 
-      // Policy: within a single ACP connection (one client window), keep only one live pi subprocess.
-      // This avoids leaking subprocesses when clients start new sessions but don't explicitly close old ones.
-      // It does NOT affect other client windows because they run in separate agent processes.
-      //
-      // (Tests sometimes stub out `this.sessions`, so guard the call.)
-    ;(this.sessions as any).closeAllExcept?.(session.sessionId)
-
     const response = {
       sessionId: session.sessionId,
       models,
@@ -268,7 +314,7 @@ export class PiAcpAgent implements ACPAgent {
           const pi = (await session.proc.getCommands()) as any
           const { commands } = toAvailableCommandsFromPiGetCommands(pi, {
             enableSkillCommands,
-            includeExtensionCommands: false
+            includeExtensionCommands: enableExtensionCommands
           })
 
           await this.conn.sessionUpdate({
@@ -303,7 +349,7 @@ export class PiAcpAgent implements ACPAgent {
   }
 
   async prompt(params: PromptRequest): Promise<PromptResponse> {
-    const session = this.sessions.get(params.sessionId)
+    const session = await this.requireSession(params.sessionId)
 
     const { message, images } = promptToPiMessage(params.prompt)
 
@@ -760,7 +806,7 @@ export class PiAcpAgent implements ACPAgent {
   }
 
   async cancel(params: CancelNotification): Promise<void> {
-    const session = this.sessions.get(params.sessionId)
+    const session = await this.requireSession(params.sessionId)
     await session.cancel()
   }
 
@@ -831,6 +877,7 @@ export class PiAcpAgent implements ACPAgent {
 
     const fileCommands = loadSlashCommands(params.cwd)
     const enableSkillCommands = getEnableSkillCommands(params.cwd)
+    const enableExtensionCommands = getEnableExtensionCommands(params.cwd)
 
     const session = this.sessions.getOrCreate(params.sessionId, {
       cwd: params.cwd,
@@ -839,10 +886,6 @@ export class PiAcpAgent implements ACPAgent {
       proc,
       fileCommands
     })
-
-    // Policy: within a single ACP connection (one Zed window), keep only one live pi subprocess.
-    // (Tests sometimes stub out `this.sessions`, so guard the call.)
-    ;(this.sessions as any).closeAllExcept?.(session.sessionId)
 
     // (Optional) ensure mapping stays fresh.
     this.store.upsert({
@@ -937,7 +980,7 @@ export class PiAcpAgent implements ACPAgent {
           const pi = (await proc.getCommands()) as any
           const { commands } = toAvailableCommandsFromPiGetCommands(pi, {
             enableSkillCommands,
-            includeExtensionCommands: false
+            includeExtensionCommands: enableExtensionCommands
           })
 
           await this.conn.sessionUpdate({
@@ -966,7 +1009,7 @@ export class PiAcpAgent implements ACPAgent {
   }
 
   async unstable_setSessionModel(params: { sessionId: string; modelId: string }): Promise<void> {
-    const session = this.sessions.get(params.sessionId)
+    const session = await this.requireSession(params.sessionId)
 
     // Accept either:
     //  - "provider/model" (preferred, matches how we advertise)
@@ -1000,7 +1043,7 @@ export class PiAcpAgent implements ACPAgent {
   }
 
   async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
-    const session = this.sessions.get(params.sessionId)
+    const session = await this.requireSession(params.sessionId)
 
     const mode = String(params.modeId)
     if (!isThinkingLevel(mode)) {
@@ -1317,13 +1360,7 @@ function buildStartupInfo(opts: {
     const settings = JSON.parse(readFileSync(settingsPath, 'utf-8')) as any
     const pkgs: string[] = Array.isArray(settings?.packages) ? settings.packages : []
     for (const pkg of pkgs) {
-      const s = String(pkg)
-      if (s.startsWith('npm:')) {
-        // Render a two-line bullet structure using markdown indentation.
-        extItems.push(`${s}\n  - index.ts`)
-      } else {
-        extItems.push(s)
-      }
+      extItems.push(String(pkg))
     }
   } catch {
     // ignore

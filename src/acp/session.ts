@@ -203,6 +203,12 @@ export class PiAcpSession {
   // Compatible format may need to be implemented in pi in the future.
   private editSnapshots = new Map<string, { path: string; oldText: string }>()
 
+  // Map bash/execute tool call IDs to pseudo-terminal IDs so Zed creates
+  // display-only terminal entities. This triggers ViewEvent::NewTerminal,
+  // which populates `expanded_tool_calls` and makes `expand_terminal_card`
+  // work for external ACP agents.
+  private terminalIds = new Map<string, string>()
+
   // Ensure `session/update` notifications are sent in order and can be awaited
   // before completing a `session/prompt` request.
   private lastEmit: Promise<void> = Promise.resolve()
@@ -386,9 +392,13 @@ export class PiAcpSession {
           break
         }
 
+        // Emit thinking as agent_message_chunk instead of agent_thought_chunk.
+        // Zed renders thought chunks in collapsed thinking cards with no setting
+        // to auto-expand them (see zed-industries/zed#53269). Sending as regular
+        // message content ensures the reasoning is always visible.
         if (ame?.type === 'thinking_delta' && typeof ame.delta === 'string') {
           this.emit({
-            sessionUpdate: 'agent_thought_chunk',
+            sessionUpdate: 'agent_message_chunk',
             content: { type: 'text', text: ame.delta } satisfies ContentBlock
           })
           break
@@ -424,6 +434,16 @@ export class PiAcpSession {
             const existingStatus = this.currentToolCalls.get(toolCallId)
             // IMPORTANT: never downgrade status (e.g. if we already marked in_progress via tool_execution_start).
             const status = existingStatus ?? 'pending'
+            const toolKind = toToolKind(toolName)
+
+            // For bash/execute tools, assign a pseudo-terminal ID early so the
+            // initial `tool_call` event includes _meta.terminal_info. Zed only
+            // checks for terminal_info on `tool_call`, not `tool_call_update`.
+            let termId: string | undefined
+            if (toolKind === 'execute' && !existingStatus) {
+              termId = `pi-term-${toolCallId}`
+              this.terminalIds.set(toolCallId, termId)
+            }
 
             if (!existingStatus) {
               this.currentToolCalls.set(toolCallId, 'pending')
@@ -431,10 +451,11 @@ export class PiAcpSession {
                 sessionUpdate: 'tool_call',
                 toolCallId,
                 title: toolName,
-                kind: toToolKind(toolName),
+                kind: toolKind,
                 status,
                 locations,
-                rawInput
+                rawInput,
+                ...(termId ? { _meta: { terminal_info: { terminal_id: termId, cwd: this.cwd } } } : {})
               })
             } else {
               // Best-effort: keep rawInput updated while args are streaming.
@@ -481,6 +502,16 @@ export class PiAcpSession {
 
         const locations = toToolCallLocations(args, this.cwd, line)
 
+        // For bash/execute tools, ensure a pseudo-terminal ID is assigned so Zed
+        // creates a display-only terminal entity. The ID may already exist if
+        // the tool call was surfaced during message_update toolcall_start.
+        const isExecute = toToolKind(toolName) === 'execute'
+        let terminalId = this.terminalIds.get(toolCallId)
+        if (isExecute && !terminalId) {
+          terminalId = `pi-term-${toolCallId}`
+          this.terminalIds.set(toolCallId, terminalId)
+        }
+
         // If we already surfaced the tool call while the model streamed it, just transition.
         if (!this.currentToolCalls.has(toolCallId)) {
           this.currentToolCalls.set(toolCallId, 'in_progress')
@@ -491,7 +522,10 @@ export class PiAcpSession {
             kind: toToolKind(toolName),
             status: 'in_progress',
             locations,
-            rawInput: args
+            rawInput: args,
+            // Zed reads _meta.terminal_info to create a display-only terminal entity
+            // associated with this tool call.
+            ...(terminalId ? { _meta: { terminal_info: { terminal_id: terminalId, cwd: this.cwd } } } : {})
           })
         } else {
           this.currentToolCalls.set(toolCallId, 'in_progress')
@@ -500,7 +534,8 @@ export class PiAcpSession {
             toolCallId,
             status: 'in_progress',
             locations,
-            rawInput: args
+            rawInput: args,
+            ...(terminalId ? { _meta: { terminal_info: { terminal_id: terminalId, cwd: this.cwd } } } : {})
           })
         }
 
@@ -513,6 +548,7 @@ export class PiAcpSession {
 
         const partial = (ev as any).partialResult
         const text = toolResultToText(partial)
+        const termId = this.terminalIds.get(toolCallId)
 
         this.emit({
           sessionUpdate: 'tool_call_update',
@@ -521,7 +557,9 @@ export class PiAcpSession {
           content: text
             ? ([{ type: 'content', content: { type: 'text', text } }] satisfies ToolCallContent[])
             : undefined,
-          rawOutput: partial
+          rawOutput: partial,
+          // Stream terminal output to Zed's display-only terminal entity.
+          ...(termId && text ? { _meta: { terminal_output: { terminal_id: termId, data: text } } } : {})
         })
         break
       }
@@ -564,15 +602,30 @@ export class PiAcpSession {
           content = [{ type: 'content', content: { type: 'text', text } }] satisfies ToolCallContent[]
         }
 
+        // For bash/execute tools, send terminal exit and final output via _meta
+        // so Zed's display-only terminal entity shows completion.
+        const termId = this.terminalIds.get(toolCallId)
+        const exitCode = !isError ? (result?.details?.exitCode ?? result?.exitCode ?? (result?.details?.code ?? result?.code)) : undefined
+
         this.emit({
           sessionUpdate: 'tool_call_update',
           toolCallId,
           status: isError ? 'failed' : 'completed',
           content,
-          rawOutput: result
+          rawOutput: result,
+          ...(termId ? {
+            _meta: {
+              ...(text ? { terminal_output: { terminal_id: termId, data: text } } : {}),
+              terminal_exit: {
+                terminal_id: termId,
+                exit_code: typeof exitCode === 'number' ? exitCode : (isError ? 1 : 0)
+              }
+            }
+          } : {})
         })
 
         this.currentToolCalls.delete(toolCallId)
+        this.terminalIds.delete(toolCallId)
         this.editSnapshots.delete(toolCallId)
         break
       }

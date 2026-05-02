@@ -34,7 +34,7 @@ test('PiAcpSession: emits agent_message_chunk for text_delta', async () => {
   })
 })
 
-test('PiAcpSession: emits agent_thought_chunk for thinking_delta', async () => {
+test('PiAcpSession: emits agent_message_chunk for thinking_delta (workaround for collapsed thinking cards)', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
 
@@ -57,7 +57,7 @@ test('PiAcpSession: emits agent_thought_chunk for thinking_delta', async () => {
   assert.equal(conn.updates.length, 1)
   assert.equal(conn.updates[0]!.sessionId, 's1')
   assert.deepEqual(conn.updates[0]!.update, {
-    sessionUpdate: 'agent_thought_chunk',
+    sessionUpdate: 'agent_message_chunk',
     content: { type: 'text', text: 'thinking...' }
   })
 })
@@ -96,6 +96,10 @@ test('PiAcpSession: emits tool_call + tool_call_update + completes', async () =>
   assert.equal((conn.updates[0]!.update as any).toolCallId, 't1')
   assert.equal((conn.updates[0]!.update as any).status, 'in_progress')
   assert.equal((conn.updates[0]!.update as any).locations, undefined)
+  // bash maps to execute ToolKind, so _meta.terminal_info is included.
+  assert.deepEqual((conn.updates[0]!.update as any)._meta, {
+    terminal_info: { terminal_id: 'pi-term-t1', cwd: process.cwd() }
+  })
 
   assert.equal(conn.updates[1]!.update.sessionUpdate, 'tool_call_update')
   assert.equal((conn.updates[1]!.update as any).toolCallId, 't1')
@@ -104,6 +108,11 @@ test('PiAcpSession: emits tool_call + tool_call_update + completes', async () =>
   assert.equal(conn.updates[2]!.update.sessionUpdate, 'tool_call_update')
   assert.equal((conn.updates[2]!.update as any).toolCallId, 't1')
   assert.equal((conn.updates[2]!.update as any).status, 'completed')
+  // Completed bash tool call has terminal_exit in _meta.
+  assert.deepEqual((conn.updates[2]!.update as any)._meta, {
+    terminal_output: { terminal_id: 'pi-term-t1', data: 'done' },
+    terminal_exit: { terminal_id: 'pi-term-t1', exit_code: 0 }
+  })
 })
 
 test('PiAcpSession: emits tool locations from pi path args', async () => {
@@ -366,6 +375,41 @@ test('PiAcpSession: emits streamed tool locations from pi path args', async () =
   assert.equal(conn.updates.length, 1)
   assert.equal(conn.updates[0]!.update.sessionUpdate, 'tool_call')
   assert.deepEqual((conn.updates[0]!.update as any).locations, [{ path: '/tmp/test.txt' }])
+})
+
+test('PiAcpSession: streams bash tool_call with terminal_info on toolcall_start', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: {
+      type: 'toolcall_start',
+      toolCall: {
+        id: 't1',
+        name: 'bash',
+        arguments: { cmd: 'echo hello' }
+      }
+    }
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(conn.updates.length, 1)
+  assert.equal(conn.updates[0]!.update.sessionUpdate, 'tool_call')
+  assert.equal((conn.updates[0]!.update as any).kind, 'execute')
+  assert.deepEqual((conn.updates[0]!.update as any)._meta, {
+    terminal_info: { terminal_id: 'pi-term-t1', cwd: process.cwd() }
+  })
 })
 
 test('PiAcpSession: emits edit tool line when oldText matches uniquely', async () => {
